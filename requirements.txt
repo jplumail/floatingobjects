@@ -1,6 +1,4 @@
 geopandas
-rasterio
-numpy
 scikit-learn
 scikit-image
 torch
