@@ -1,5 +1,5 @@
 import argparse
-from train import main as train
+from .train import main as train
 import os
 
 def main(args):

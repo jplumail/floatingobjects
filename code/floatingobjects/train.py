@@ -8,10 +8,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
-from model import get_model
-from data import FloatingSeaObjectDataset
-from visualization import plot_batch
-from transforms import get_transform
+from .model import get_model
+from .data import FloatingSeaObjectDataset
+from .visualization import plot_batch
+from .transforms import get_transform
 import json
 from sklearn.metrics import precision_recall_fscore_support, cohen_kappa_score
 

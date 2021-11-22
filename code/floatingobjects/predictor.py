@@ -1,16 +1,16 @@
-from model import get_model
+from .model import get_model
 import torch
 import rasterio
 from rasterio.windows import Window
 import numpy as np
 from itertools import product
-from data import l1cbands, l2abands
+from .data import l1cbands, l2abands
 import os
 from tqdm import tqdm
 import argparse
-from transforms import get_transform
+from .transforms import get_transform
 from scipy.ndimage.filters import gaussian_filter, median_filter
-from data import get_region_split
+from .data import get_region_split
 
 class PythonPredictor():
 

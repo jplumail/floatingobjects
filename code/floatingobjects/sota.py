@@ -1,18 +1,18 @@
 import sys
 import os
-from data import FloatingSeaObjectDataset
-from visualization import plot_batch, calculate_fdi, ndvi_transform, s2_to_RGB, plot_curves
-from train import predict_images
+from .data import FloatingSeaObjectDataset
+from .visualization import plot_batch, calculate_fdi, ndvi_transform, s2_to_RGB, plot_curves
+from .train import predict_images
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from visualization import calculate_fdi, ndvi_transform
+from .visualization import calculate_fdi, ndvi_transform
 import torch
 import rasterio
 from tqdm.auto import tqdm as tq
 from torch.utils.data import DataLoader, random_split
 from sklearn.metrics import confusion_matrix
-from model import UNet, get_model
+from .model import UNet, get_model
 from sklearn.metrics import roc_curve, auc, precision_recall_curve
 from sklearn.metrics import RocCurveDisplay, PrecisionRecallDisplay
 

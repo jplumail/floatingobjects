@@ -4,9 +4,9 @@
 import numpy as np
 import rasterio
 
-from transforms import calculate_fdi, calculate_ndvi
+from .transforms import calculate_fdi, calculate_ndvi
 from skimage.exposure import equalize_hist
-from data import l2abands, l1cbands
+from .data import l2abands, l1cbands
 import matplotlib
 import matplotlib.cm
 import subprocess
