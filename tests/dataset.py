@@ -7,7 +7,7 @@ import unittest
 from data import FloatingSeaObjectRegionDataset, FloatingSeaObjectDataset
 import numpy as np
 
-TESTS_DATA_ROOT = os.environ.get('TESTS_DATA_ROOT', '/data')
+TESTS_DATA_ROOT = os.environ.get('TESTS_DATA_ROOT', 'data')
 
 class DatasetRegionTestCases(unittest.TestCase):
 
