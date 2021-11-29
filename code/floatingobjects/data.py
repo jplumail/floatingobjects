@@ -43,6 +43,19 @@ allregions = [
     "vungtau_20180423"
     ]
 
+folds = [
+    {
+        "train": [1, 2, 5, 10, 11, 13, 14, 16, 17, 18, 19, 20, 22, 24, 25],
+        "val": [4, 6, 7, 8, 9, 23],
+        "test": [0, 3, 12, 15, 21]
+    },
+    {
+        "train": [2, 3, 4, 6, 7, 10, 13, 14, 17, 18, 19, 20, 21, 22, 23],
+        "val": [0, 1, 15, 16, 24, 25],
+        "test": [5, 8, 9, 11, 12]
+    }
+]
+
 def get_region_split(seed=0, fractions=(0.6, 0.2, 0.2)):
 
     # fix random state
@@ -233,11 +246,17 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
 
 
 class FloatingSeaObjectDataset(torch.utils.data.ConcatDataset):
-    def __init__(self, root, fold="train", seed=0, **kwargs):
+    def __init__(self, root, fold="train", seed=1, foldn=None, **kwargs):
         assert fold in ["train", "val", "test"]
+        if foldn is not None:
+            assert foldn in [1, 2]
 
         # make regions variable available to the outside
-        self.regions = get_region_split(seed)[fold]
+        if foldn is not None:
+            regions_indices = folds[foldn-1][fold]
+            self.regions = [allregions[i] for i in regions_indices]
+        else:
+            self.regions = get_region_split(seed)[fold]
 
         # initialize a concat dataset with the corresponding regions
         super().__init__(
