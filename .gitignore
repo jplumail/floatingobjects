@@ -2,3 +2,6 @@ data/
 logs/
 *.pth.tar
 models
+build/
+*.pyc
+*.egg-info
