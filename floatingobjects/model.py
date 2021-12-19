@@ -160,19 +160,15 @@ class Classifier(nn.Module):
         y_pred = torch.sigmoid(self.resnet18(x))
         return y_pred
     
-    def sliding_windows(self, x, mask, threshold=0.1):
+    def sliding_windows(self, x, mask):
         # x of shape (N, C, H, W)
         # mask : binary mask of shape (N, H, W)
         # returns
         N, C, H, W = x.shape
-        masks = []
+        out = torch.zeros_like(mask, dtype=torch.float32)
         for i in range(N):
-            mask_i = mask[i]
-            mask_out = torch.zeros_like(mask_i)
-            out = torch.zeros_like(mask_i, dtype=torch.float32)
-
             # bbox of the ship
-            idx_nonzero = mask_i.nonzero()
+            idx_nonzero = mask[i].nonzero()
             if idx_nonzero.shape[0] > 0:
                 min_h, max_h, min_w, max_w = idx_nonzero[:, 0].min(), idx_nonzero[:, 0].max(), idx_nonzero[:, 1].min(), idx_nonzero[:, 1].max()
                 top, bottom, left, right = min_h - 8, max_h + 7, min_w - 8, max_w + 7
@@ -197,17 +193,12 @@ class Classifier(nn.Module):
                 x_unfold = x_unfold[0].view(C, 16, 16, -1).permute((3, 0, 1, 2)) # shape (L, C, h, w)
                 out_unfold = self.forward(x_unfold) # shape (L)
                 out_fold = out_unfold.view(1, 1, max_h-min_h+1, max_w-min_w+1) # shape (H, W)
-                print(out_fold.mean(), out_fold.var(), out_fold.max())
 
                 # Mean filter 16x16
                 norm_tensor = F.conv2d(torch.ones_like(out_fold), self.mean_filter, padding='same')
                 out_mean = F.conv2d(out_fold, self.mean_filter, padding='same') / norm_tensor
 
                 # Apply threshold
-                mask_out[min_h:max_h+1, min_w:max_w+1] = (out_mean > threshold)
-                out[min_h:max_h+1, min_w:max_w+1] = out_mean
-
-
-            masks.append(mask_out)
-            
-        return torch.stack(masks, dim=0)
+                out[i, min_h:max_h+1, min_w:max_w+1] = out_mean
+        
+        return out

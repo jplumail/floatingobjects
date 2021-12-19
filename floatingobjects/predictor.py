@@ -29,8 +29,11 @@ class PythonPredictor():
         # Load classifier if specified
         if classifier_path:
             self.classifier = get_model("classifier")
-            self.classifier.load_state_dict(torch.load(classifier_path)["state_dict"])
+            checkpoint = torch.load(classifier_path)
+            self.classifier.load_state_dict(checkpoint["state_dict"])
             self.classifier = self.classifier.to(device)
+            self.center = checkpoint["center"].to(device)
+            self.scale = checkpoint["scale"].to(device)
         else:
             self.classifier = None
         
@@ -98,11 +101,15 @@ class PythonPredictor():
                             y_logits /= 3
                     
                     if self.classifier:
-                        mask_floating_objects = y_logits > 0.2
-                        tensor = torch.from_numpy(image.astype(np.float32).astype(np.uint16).astype(np.uint8) / 255.0).to(self.device).unsqueeze(0)
-                        tensor = tensor.float()
-                        mask_ship = self.classifier.sliding_windows(tensor, mask_floating_objects, threshold=0.08)
-                        
+                        mask_floating_objects = y_logits > 0.05
+                        tensor = torch.from_numpy(image.astype(np.float32)).float().to(self.device).unsqueeze(0)
+                        # Image transformation
+                        tensor -= self.center[:,None,None]
+                        tensor /= self.scale[:,None,None]
+
+                        # Apply sliding windows
+                        classifier_scores = self.classifier.sliding_windows(tensor, mask_floating_objects)
+                        mask_ship = classifier_scores > 5e-4
                         y_logits[mask_ship] = 0.
 
                     y_score = y_logits.cpu().detach().numpy()[0]
