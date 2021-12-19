@@ -26,8 +26,8 @@ def s2_to_RGB(scene):
     return equalize_hist(tensor.swapaxes(0,1).swapaxes(1,2))
 
 def ndvi_transform(scene):
-    NIR = scene[bands.index("B8")]
-    RED = scene[bands.index("B4")]
+    NIR = scene[bands.index("B8")] * 1e-4
+    RED = scene[bands.index("B4")] * 1e-4
     return (NIR - RED) / (NIR + RED + 1e-12)
 
 def plot_batch(images, masks, y_preds):
