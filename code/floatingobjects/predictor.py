@@ -15,7 +15,7 @@ from .data import get_region_split
 class PythonPredictor():
 
     #def __init__(self, modelname, modelpath, image_size=(480,480), device="cpu", offset=64, use_test_aug=2, add_fdi_ndvi=False):
-    def __init__(self, modelpath, image_size=(480,480), device="cpu", offset=64, use_test_aug=2, add_fdi_ndvi=False):
+    def __init__(self, modelpath, image_size=(480,480), device="cpu", offset=64, use_test_aug=2, add_fdi_ndvi=False, classifier_path=None):
         self.image_size = image_size
         self.device = device
         self.offset = offset # remove border effects from the CNN
@@ -25,6 +25,15 @@ class PythonPredictor():
         #self.model = get_model(modelname, inchannels=12 if not add_fdi_ndvi else 14)
         self.model.load_state_dict(torch.load(modelpath)["model_state_dict"])
         self.model = self.model.to(device)
+
+        # Load classifier if specified
+        if classifier_path:
+            self.classifier = get_model("classifier")
+            self.classifier.load_state_dict(torch.load(classifier_path)["state_dict"])
+            self.classifier = self.classifier.to(device)
+        else:
+            self.classifier = None
+        
         self.transform = get_transform("test", add_fdi_ndvi=add_fdi_ndvi)
         self.use_test_aug = use_test_aug
 
@@ -32,6 +41,7 @@ class PythonPredictor():
         with rasterio.open(path, "r") as src:
             meta = src.meta
         self.model.eval()
+        if self.classifier: self.classifier.eval()
 
         # for prediction
         predimage = os.path.join(predpath, os.path.basename(path))
@@ -62,12 +72,12 @@ class PythonPredictor():
                     image = image[[l1cbands.index(b) for b in l2abands]]
 
                 # to torch + normalize
-                image = self.transform(torch.from_numpy(image.astype(np.float32)), [])[0].to(self.device)
+                x = self.transform(torch.from_numpy(image.astype(np.float32)), [])[0].to(self.device)
 
                 # predict
                 with torch.no_grad():
-                    x = image.unsqueeze(0)
-                    #import pdb; pdb.set_trace()
+                    x = x.unsqueeze(0)
+                    #import pdb; pdb.set_trace() 
                     y_logits = torch.sigmoid(self.model(x).squeeze(0))
                     if self.use_test_aug > 0:
                         y_logits += torch.sigmoid(torch.fliplr(self.model(torch.fliplr(x)))).squeeze(0) # fliplr)
@@ -78,6 +88,14 @@ class PythonPredictor():
                             y_logits /= 6
                         else:
                             y_logits /= 3
+                    
+                    if self.classifier:
+                        mask_floating_objects = y_logits > 0.2
+                        tensor = torch.from_numpy(image.astype(np.float32).astype(np.uint16).astype(np.uint8) / 255.0).to(self.device).unsqueeze(0)
+                        tensor = tensor.float()
+                        mask_ship = self.classifier.sliding_windows(tensor, mask_floating_objects, threshold=0.08)
+                        
+                        y_logits[mask_ship] = 0.
 
                     y_score = y_logits.cpu().detach().numpy()[0]
                     #y_score = y_score[:,self.offset:-self.offset, self.offset:-self.offset]
