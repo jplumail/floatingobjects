@@ -246,17 +246,20 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
 
 
 class FloatingSeaObjectDataset(torch.utils.data.ConcatDataset):
-    def __init__(self, root, fold="train", seed=1, foldn=None, **kwargs):
-        assert fold in ["train", "val", "test"]
-        if foldn is not None:
+    def __init__(self, root, fold=None, seed=None, foldn=None, **kwargs):
+        if fold:
+            assert fold in ["train", "val", "test"]
+        if foldn:
             assert foldn in [1, 2]
 
         # make regions variable available to the outside
-        if foldn is not None:
+        if foldn and fold:
             regions_indices = folds[foldn-1][fold]
             self.regions = [allregions[i] for i in regions_indices]
-        else:
+        elif seed:
             self.regions = get_region_split(seed)[fold]
+        else:
+            self.regions = allregions
 
         # initialize a concat dataset with the corresponding regions
         super().__init__(
