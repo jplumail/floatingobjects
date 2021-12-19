@@ -71,6 +71,14 @@ class PythonPredictor():
                 if (image.shape[0] == 13):
                     image = image[[l1cbands.index(b) for b in l2abands]]
 
+                # pad if on borders
+                left, top, right, bottom = c-self.offset, r-self.offset, c + W, r + H
+                pad_left = max(0, -left)
+                pad_top = max(0, -top)
+                pad_right = max(0, right-meta["width"])
+                pad_bottom = max(0, bottom-meta["height"])
+                image = np.pad(image, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
+
                 # to torch + normalize
                 x = self.transform(torch.from_numpy(image.astype(np.float32)), [])[0].to(self.device)
 
