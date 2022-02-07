@@ -1,5 +1,6 @@
 import torch
 from rasterio.windows import from_bounds
+from rasterio.windows import Window
 import rasterio as rio
 from rasterio import features
 from shapely.geometry import LineString, Polygon
@@ -7,6 +8,7 @@ import geopandas as gpd
 import os
 import numpy as np
 import pandas as pd
+from itertools import product
 
 l1cbands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B10", "B11", "B12"]
 l2abands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
@@ -172,6 +174,85 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
         zy += bottom + offset
 
         return gpd.GeoDataFrame(geometry=gpd.points_from_xy(zx, zy))
+    
+    def get_negative_patches(self, model):
+        """This method returns the patches that doesn't contain floating objects
+         which have a bad score (bad false positive rate) 
+        Args:
+         - model: the model to test
+        Returns:
+         - patches: Geodataframe of Point geometries, store negative patches
+        """
+
+        with rio.open(self.imagefile, "r") as src:
+            meta = src.meta
+        model.eval()
+        
+        H, W = self.output_size
+
+        rows = np.arange(0, meta["height"], H)
+        cols = np.arange(0, meta["width"], W)
+
+        image_window = Window(0, 0, meta["width"], meta["height"])
+
+        patches_x = []
+        patches_y = []
+        false_positive_rates = []
+
+        floating_objects_lines = self.lines.loc[~self.lines["is_hnm"]]
+
+        for r, c in product(rows, cols):
+
+            window = image_window.intersection(
+                Window(c-self.offset, r-self.offset, W+self.offset, H+self.offset))
+            
+            # peut être utiliser la fonction Polygon()?
+            poly = Polygon(window) # ça ne marche pas
+            if floating_objects_lines.crosses(poly).sum() == 0: # Check if there is a floating object in the windows
+                
+                # write
+                left, bottom, right, top = window.bounds
+                x = (right - left) / 2
+                y = (top - bottom) / 2
+                patches_x.append(x)
+                patches_y.append(y)
+
+                with rio.open(self.imagefile) as src:
+                    image = src.read(window=window)
+
+                # if L1C image (13 bands). read only the 12 bands compatible with L2A data
+                if (image.shape[0] == 13):
+                    image = image[[l1cbands.index(b) for b in l2abands]]
+
+                # pad if on borders
+                left, top, right, bottom = c-self.offset, r-self.offset, c + W, r + H
+                pad_left = max(0, -left)
+                pad_top = max(0, -top)
+                pad_right = max(0, right-meta["width"])
+                pad_bottom = max(0, bottom-meta["height"])
+                image = np.pad(image, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
+
+                # to torch + normalize
+                x = self.transform(torch.from_numpy(image.astype(np.float32)), [])[0].to(self.device)
+
+                # predict
+                with torch.no_grad():
+                    x = x.unsqueeze(0)
+                    #import pdb; pdb.set_trace() 
+                    y_logits = torch.sigmoid(model(x).squeeze(0))
+                    y_score = y_logits.cpu().detach().numpy()[0]
+                    false_positive_rate = ... #To Do
+                    false_positive_rates.append(false_positive_rate)
+        
+        N = len(self.floating_objects_lines) * 3
+        # Take zx, zy from patches_x, patches_y based on the false positive rates
+        # len(zx) = len(zy) = N
+        ...
+
+        # Create the geodataframe
+        patches = gpd.GeoDataFrame(geometry=gpd.points_from_xy(zx, zy))
+
+        return patches
 
     def __len__(self):
         return len(self.lines)
@@ -265,6 +346,18 @@ class FloatingSeaObjectDataset(torch.utils.data.ConcatDataset):
         super().__init__(
             [FloatingSeaObjectRegionDataset(root, region, **kwargs) for region in self.regions]
         )
+    
+    def update_hard_negative_mining(self, model):
+        for dataset in self.datasets:
+            # Get the HNM patches
+            hnm_patches = dataset.get_negative_patches(model)
+            hnm_patches["is_hnm"] = True
+            
+            # Delete the previous HNM
+            dataset.lines = dataset.lines.loc[~dataset.lines["is_hnm"]]
+            
+            # Add the new HNM patches to dataset 
+            dataset.lines = pd.concat([dataset.lines, hnm_patches]).reset_index(drop=True)
 
 
 def line_is_closed(linestringgeometry):
