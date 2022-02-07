@@ -246,8 +246,15 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
         
         N = len(self.floating_objects_lines) * 3
         # Take zx, zy from patches_x, patches_y based on the false positive rates
-        # len(zx) = len(zy) = N
-        ...
+        zx = []
+        zy = []
+        dict_f = {}
+        for i in range(len(patches_x)):
+            dict_f[(patches_x[i],patches_y[i])] = false_positive_rates[i]
+        false_positive_rates_N = sorted(dict_f.items(), key=lambda x: x[1])[:N]
+        for item in false_positive_rates_N:
+            zx.append(item[0][0])
+            zy.append(item[0][1])
 
         # Create the geodataframe
         patches = gpd.GeoDataFrame(geometry=gpd.points_from_xy(zx, zy))
