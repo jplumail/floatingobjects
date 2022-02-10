@@ -188,7 +188,7 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
             meta = src.meta
         model.eval()
         
-        H, W = self.output_size
+        H, W = self.output_size, self.output_size
 
         rows = np.arange(0, meta["height"], H)
         cols = np.arange(0, meta["width"], W)
@@ -200,18 +200,25 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
         false_positive_rates = []
 
         floating_objects_lines = self.lines.loc[~self.lines["is_hnm"]]
+        threshold = 0.03
 
         for r, c in product(rows, cols):
 
             window = image_window.intersection(
-                Window(c-self.offset, r-self.offset, W+self.offset, H+self.offset))
+                Window(c, r, W, H))
             
             # peut être utiliser la fonction Polygon()?
-            poly = Polygon(window) # ça ne marche pas
+            xs, ys = rio.transform.xy(
+                self.imagemeta["transform"],
+                [window.row_off, window.row_off, window.row_off+window.width, window.row_off],
+                [window.col_off, window.col_off+window.height, window.col_off+window.height, window.col_off+window.height]
+            )
+            points = list(zip(xs,ys))
+            poly = Polygon(points)
             if floating_objects_lines.crosses(poly).sum() == 0: # Check if there is a floating object in the windows
                 
                 # write
-                left, bottom, right, top = window.bounds
+                left, bottom, right, top = poly.bounds
                 x = (right - left) / 2
                 y = (top - bottom) / 2
                 patches_x.append(x)
@@ -225,7 +232,7 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
                     image = image[[l1cbands.index(b) for b in l2abands]]
 
                 # pad if on borders
-                left, top, right, bottom = c-self.offset, r-self.offset, c + W, r + H
+                left, top, right, bottom = c, r, c + W, r + H
                 pad_left = max(0, -left)
                 pad_top = max(0, -top)
                 pad_right = max(0, right-meta["width"])
@@ -233,7 +240,9 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
                 image = np.pad(image, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
 
                 # to torch + normalize
-                x = self.transform(torch.from_numpy(image.astype(np.float32)), [])[0].to(self.device)
+                x = torch.from_numpy(image.astype(np.float32))
+                if self.transform is not None:
+                    x = self.transform(x, [])[0].to(self.device)
 
                 # predict
                 with torch.no_grad():
@@ -241,7 +250,7 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
                     #import pdb; pdb.set_trace() 
                     y_logits = torch.sigmoid(model(x).squeeze(0))
                     y_score = y_logits.cpu().detach().numpy()[0]
-                    false_positive_rate = ... #To Do
+                    false_positive_rate = (y_score > threshold).sum() / y_score.size
                     false_positive_rates.append(false_positive_rate)
         
         N = len(self.floating_objects_lines) * 3
@@ -372,3 +381,15 @@ def line_is_closed(linestringgeometry):
     first_point = coordinates[0]
     last_point = coordinates[-1]
     return bool((first_point == last_point).all())
+
+if __name__ == "__main__":
+    data = FloatingSeaObjectDataset(
+        "C:\\Users\\jeanp\\Documents\\IMTA\\projet3A\\projet3A-git\\floatingobjects\\data",
+        fold="val",
+        foldn=1
+    )
+
+    from floatingobjects.model import get_model
+    model = get_model("unet", pretrained=False)
+    
+    data.update_hard_negative_mining(model)
