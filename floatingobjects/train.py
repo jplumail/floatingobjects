@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument('--augmentation-intensity', type=int, default=1, help="number indicating intensity 0, 1 (noise), 2 (channel shuffle)")
     parser.add_argument('--model', type=str, default="unet")
     parser.add_argument('--add-fdi-ndvi', action="store_true")
+    parser.add_argument('--hnm', action="store_true")
     parser.add_argument('--image-size', type=int, default=128)
     parser.add_argument('--device', type=str, choices=["cpu", "cuda"], default="cuda")
     parser.add_argument('--epochs', type=int, default=50)
@@ -48,6 +49,7 @@ def main(args):
     device = args.device
     n_epochs = args.epochs
     learning_rate = args.learning_rate
+    hnm = args.hnm
 
     tensorboard_logdir = args.tensorboard_logdir
 
@@ -108,6 +110,12 @@ def main(args):
 
     for epoch in range(start_epoch, n_epochs + 1):
         trainloss = training_epoch(model, train_loader, optimizer, criterion, device)
+
+        if hnm:
+            # Update the dataset, test the negative patches of the dataset
+            # take the ones with the worst false positive rates and add them to the dataset
+            dataset.update_hard_negative_mining(model)
+            
         valloss, metrics = validating_epoch(model, val_loader, criterion, device)
 
         log = dict(
