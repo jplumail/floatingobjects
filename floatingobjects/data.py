@@ -9,6 +9,7 @@ import os
 import numpy as np
 import pandas as pd
 from itertools import product
+from tqdm import tqdm
 
 l1cbands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B10", "B11", "B12"]
 l2abands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
@@ -93,7 +94,7 @@ def split_line_gdf_into_segments(lines):
 
 class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
     def __init__(self, root, region, output_size=64,
-                 transform=None, hard_negative_mining=True,
+                 transform=None, hard_negative_mining=False,
                  use_l2a_probability=0.5):
 
         shapefile = os.path.join(root, region + ".shp")
@@ -201,6 +202,7 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
 
         floating_objects_lines = self.lines.loc[~self.lines["is_hnm"]]
         threshold = 0.03
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
         for r, c in product(rows, cols):
 
@@ -210,8 +212,8 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
             # peut être utiliser la fonction Polygon()?
             xs, ys = rio.transform.xy(
                 self.imagemeta["transform"],
-                [window.row_off, window.row_off, window.row_off+window.width, window.row_off],
-                [window.col_off, window.col_off+window.height, window.col_off+window.height, window.col_off+window.height]
+                [window.row_off, window.row_off, window.row_off+window.width, window.row_off+window.width],
+                [window.col_off, window.col_off+window.height, window.col_off+window.height, window.col_off]
             )
             points = list(zip(xs,ys))
             poly = Polygon(points)
@@ -219,8 +221,8 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
                 
                 # write
                 left, bottom, right, top = poly.bounds
-                x = (right - left) / 2
-                y = (top - bottom) / 2
+                x = (right + left) / 2
+                y = (top + bottom) / 2
                 patches_x.append(x)
                 patches_y.append(y)
 
@@ -242,7 +244,8 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
                 # to torch + normalize
                 x = torch.from_numpy(image.astype(np.float32))
                 if self.transform is not None:
-                    x = self.transform(x, [])[0].to(self.device)
+                    x, _ = self.transform(x, torch.zeros_like(x))
+                    x = x.to(device)
 
                 # predict
                 with torch.no_grad():
@@ -253,7 +256,7 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
                     false_positive_rate = (y_score > threshold).sum() / y_score.size
                     false_positive_rates.append(false_positive_rate)
         
-        N = len(self.floating_objects_lines) * 3
+        N = min(len(floating_objects_lines) * 3, len(patches_x))
         # Take zx, zy from patches_x, patches_y based on the false positive rates
         zx = []
         zy = []
@@ -364,7 +367,7 @@ class FloatingSeaObjectDataset(torch.utils.data.ConcatDataset):
         )
     
     def update_hard_negative_mining(self, model):
-        for dataset in self.datasets:
+        for dataset in tqdm(self.datasets):
             # Get the HNM patches
             hnm_patches = dataset.get_negative_patches(model)
             hnm_patches["is_hnm"] = True
@@ -374,6 +377,9 @@ class FloatingSeaObjectDataset(torch.utils.data.ConcatDataset):
             
             # Add the new HNM patches to dataset 
             dataset.lines = pd.concat([dataset.lines, hnm_patches]).reset_index(drop=True)
+        
+        super().__init__(self.datasets)
+
 
 
 def line_is_closed(linestringgeometry):
