@@ -3,13 +3,14 @@ from rasterio.windows import from_bounds
 from rasterio.windows import Window
 import rasterio as rio
 from rasterio import features
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, Point
 import geopandas as gpd
 import os
 import numpy as np
 import pandas as pd
 from itertools import product
 from tqdm import tqdm
+import tifffile
 
 l1cbands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B10", "B11", "B12"]
 l2abands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
@@ -121,30 +122,48 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
         with rio.open(imagefile) as src:
             self.imagemeta = src.meta
             self.imagebounds = tuple(src.bounds)
+        
+        # Get geojson labels
+        self.data_path = os.path.join(root, "data", region, "data.geojson")
+        if os.path.exists(self.data_path):
+            self.lines = gpd.read_file(self.data_path)
+        else:
+            os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
+            lines = gpd.read_file(shapefile)
+            lines = lines.to_crs(self.imagemeta["crs"])
 
-        lines = gpd.read_file(shapefile)
-        lines = lines.to_crs(self.imagemeta["crs"])
+            # find closed lines, convert them to polygons and store them separately for later rasterization
+            is_closed_line = lines.geometry.apply(line_is_closed)
+            rasterize_polygons = lines.loc[is_closed_line].geometry.apply(Polygon)
 
-        # find closed lines, convert them to polygons and store them separately for later rasterization
-        is_closed_line = lines.geometry.apply(line_is_closed)
-        rasterize_polygons = lines.loc[is_closed_line].geometry.apply(Polygon)
+            self.lines = split_line_gdf_into_segments(lines)
 
-        self.lines = split_line_gdf_into_segments(lines)
+            self.lines["is_hnm"] = False
+            if hard_negative_mining:
+                random_points = self.sample_points_for_hard_negative_mining()
+                random_points["is_hnm"] = True
+                self.lines = pd.concat([self.lines, random_points]).reset_index(drop=True)
 
-        self.lines["is_hnm"] = False
-        if hard_negative_mining:
-            random_points = self.sample_points_for_hard_negative_mining()
-            random_points["is_hnm"] = True
-            self.lines = pd.concat([self.lines, random_points]).reset_index(drop=True)
+            # remove line segments that are outside the image bounds
+            self.lines = self.lines.loc[self.lines.geometry.apply(self.within_image)]
 
-        # remove line segments that are outside the image bounds
-        self.lines = self.lines.loc[self.lines.geometry.apply(self.within_image)]
+            # take lines to rasterize
+            rasterize_lines = self.lines.loc[~self.lines["is_hnm"]].geometry
 
-        # take lines to rasterize
-        rasterize_lines = self.lines.loc[~self.lines["is_hnm"]].geometry
+            # combine with polygons to rasterize
+            self.rasterize_geometries = pd.concat([rasterize_lines, rasterize_polygons])
 
-        # combine with polygons to rasterize
-        self.rasterize_geometries = pd.concat([rasterize_lines, rasterize_polygons])
+            self.lines["path-image"] = None
+            self.lines["path-mask"] = None
+            self.lines.to_file(self.data_path, driver="GeoJSON")
+
+        self.hnm_path = os.path.join(root, "hnm", region, "hnm.geojson")
+        if os.path.exists(self.hnm_path):
+            self.hnm_database = gpd.read_file(self.hnm_path)
+        else:
+            os.makedirs(os.path.dirname(self.hnm_path), exist_ok=True)
+            self.hnm_database = None
+
 
     def within_image(self, geometry):
         left, bottom, right, top = geometry.bounds
@@ -191,86 +210,102 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
         
         H, W = self.output_size, self.output_size
 
-        rows = np.arange(0, meta["height"], H)
-        cols = np.arange(0, meta["width"], W)
+        rows = np.arange(0, meta["height"]-H-1, H)
+        cols = np.arange(0, meta["width"]-W-1, W)
 
         image_window = Window(0, 0, meta["width"], meta["height"])
-
-        patches_x = []
-        patches_y = []
-        false_positive_rates = []
 
         floating_objects_lines = self.lines.loc[~self.lines["is_hnm"]]
         threshold = 0.03
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        for r, c in product(rows, cols):
+        def iterate_database(df):
+            for i, row in df.iterrows():
+                image = tifffile.imread(row["path-image"]).astype(float)
+                yield image, row["path-image"], row["path-mask"], row["geometry"]
 
-            window = image_window.intersection(
-                Window(c, r, W, H))
-            
-            # peut être utiliser la fonction Polygon()?
-            xs, ys = rio.transform.xy(
-                self.imagemeta["transform"],
-                [window.row_off, window.row_off, window.row_off+window.width, window.row_off+window.width],
-                [window.col_off, window.col_off+window.height, window.col_off+window.height, window.col_off]
-            )
-            points = list(zip(xs,ys))
-            poly = Polygon(points)
-            if floating_objects_lines.crosses(poly).sum() == 0: # Check if there is a floating object in the windows
+        def save_and_iterate_database():
+            for i, (r, c) in enumerate(product(rows, cols)):
+
+                window = image_window.intersection(
+                    Window(c, r, W, H))
                 
-                # write
-                left, bottom, right, top = poly.bounds
-                x = (right + left) / 2
-                y = (top + bottom) / 2
-                patches_x.append(x)
-                patches_y.append(y)
+                # peut être utiliser la fonction Polygon()?
+                xs, ys = rio.transform.xy(
+                    self.imagemeta["transform"],
+                    [window.row_off, window.row_off, window.row_off+window.width, window.row_off+window.width],
+                    [window.col_off, window.col_off+window.height, window.col_off+window.height, window.col_off]
+                )
+                points = list(zip(xs,ys))
+                poly = Polygon(points)
+                if floating_objects_lines.crosses(poly).sum() == 0: # Check if there is a floating object in the windows
+                    
+                    # write
+                    left, bottom, right, top = poly.bounds
+                    x = (right + left) / 2
+                    y = (top + bottom) / 2
+                    geometry = Point(x, y)
 
-                with rio.open(self.imagefile) as src:
-                    image = src.read(window=window)
+                    with rio.open(self.imagefile) as src:
+                        image = src.read(window=window)
 
-                # if L1C image (13 bands). read only the 12 bands compatible with L2A data
-                if (image.shape[0] == 13):
-                    image = image[[l1cbands.index(b) for b in l2abands]]
+                    # if L1C image (13 bands). read only the 12 bands compatible with L2A data
+                    if (image.shape[0] == 13):
+                        image = image[[l1cbands.index(b) for b in l2abands]]
+                    
+                    mask = np.zeros(image.shape[:2])
 
-                # pad if on borders
-                left, top, right, bottom = c, r, c + W, r + H
-                pad_left = max(0, -left)
-                pad_top = max(0, -top)
-                pad_right = max(0, right-meta["width"])
-                pad_bottom = max(0, bottom-meta["height"])
-                image = np.pad(image, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
+                    assert image.shape[1] == self.output_size and image.shape[2] == self.output_size, f"{self.region}-{i}-hnm returned image size {image[1].shape}"
+                    
+                    path_image = os.path.join(os.path.dirname(self.hnm_path), f"{i}-image.tif")
+                    path_mask = os.path.join(os.path.dirname(self.hnm_path), f"{i}-mask.tif")
+                    tifffile.imsave(path_image, image)
+                    tifffile.imsave(path_mask, mask)
 
-                # to torch + normalize
-                x = torch.from_numpy(image.astype(np.float32))
-                if self.transform is not None:
-                    x, _ = self.transform(x, torch.zeros_like(x))
-                    x = x.to(device)
-
-                # predict
-                with torch.no_grad():
-                    x = x.unsqueeze(0)
-                    #import pdb; pdb.set_trace() 
-                    y_logits = torch.sigmoid(model(x).squeeze(0))
-                    y_score = y_logits.cpu().detach().numpy()[0]
-                    false_positive_rate = (y_score > threshold).sum() / y_score.size
-                    false_positive_rates.append(false_positive_rate)
+                    yield image, path_image, path_mask, geometry
         
-        N = min(len(floating_objects_lines) * 3, len(patches_x))
+        if self.hnm_database is not None:
+            iterator = iterate_database(self.hnm_database)
+        else:
+            iterator = save_and_iterate_database()
+        
+        false_positive_rates = []
+
+        if self.hnm_database is None:
+            geometries = []
+            paths_image = []
+            paths_mask = []
+        for image, path_image, path_mask, geometry in iterator:
+            if self.hnm_database is None: # if the database is not built, save the patches
+                paths_image.append(path_image)
+                paths_mask.append(path_mask)
+                geometries.append(geometry)
+
+            # to torch + normalize
+            x = torch.from_numpy(image.astype(np.float32))
+            if self.transform is not None:
+                x, _ = self.transform(x, torch.zeros_like(x))
+                x = x.to(device)
+
+            # predict
+            with torch.no_grad():
+                x = x.unsqueeze(0) 
+                y_logits = torch.sigmoid(model(x).squeeze(0))
+                y_score = y_logits.cpu().detach().numpy()[0]
+                false_positive_rate = (y_score > threshold).sum() / y_score.size
+                false_positive_rates.append(false_positive_rate)
+        
+        if self.hnm_database is None:
+            # Create the HNM database
+            self.hnm_database = gpd.GeoDataFrame(data={"geometry": geometries, "path-image": paths_image, "path-mask": paths_mask})
+            self.hnm_database["is_hnm"] = True
+            self.hnm_database.to_file(self.hnm_path, driver="GeoJSON")
+        
+        N = min(len(floating_objects_lines) * 3, len(false_positive_rates))
         # Take zx, zy from patches_x, patches_y based on the false positive rates
-        zx = []
-        zy = []
-        dict_f = {}
-        for i in range(len(patches_x)):
-            dict_f[(patches_x[i],patches_y[i])] = false_positive_rates[i]
-        false_positive_rates_N = sorted(dict_f.items(), key=lambda x: x[1])[:N]
-        for item in false_positive_rates_N:
-            zx.append(item[0][0])
-            zy.append(item[0][1])
-
-        # Create the geodataframe
-        patches = gpd.GeoDataFrame(geometry=gpd.points_from_xy(zx, zy))
-
+        indices = np.array(false_positive_rates).argsort()[::-1][:N]
+        
+        patches = self.hnm_database.iloc[indices]
         return patches
 
     def __len__(self):
@@ -278,58 +313,73 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         line = self.lines.iloc[index]
-        left, bottom, right, top = line.geometry.bounds
+        if (line["path-image"] is not None) and (line["path-mask"] is not None): # The patch is saved in the data/region folder
+            image = tifffile.imread(line["path-image"]).astype(float)
+            mask = tifffile.imread(line["path-mask"]).astype(float)
+        
+        else: # The patch is not saved, read it on the main image then save it
+            left, bottom, right, top = line.geometry.bounds
 
-        width = right - left
-        height = top - bottom
+            width = right - left
+            height = top - bottom
 
-        # buffer_left_right = (self.output_size[0] * 10 - width) / 2
-        buffer_left_right = (self.output_size * 10 - width) / 2
-        left -= buffer_left_right
-        right += buffer_left_right
+            # buffer_left_right = (self.output_size[0] * 10 - width) / 2
+            buffer_left_right = (self.output_size * 10 - width) / 2
+            left -= buffer_left_right
+            right += buffer_left_right
 
-        # buffer_bottom_top = (self.output_size[1] * 10 - height) / 2
-        buffer_bottom_top = (self.output_size * 10 - height) / 2
-        bottom -= buffer_bottom_top
-        top += buffer_bottom_top
+            # buffer_bottom_top = (self.output_size[1] * 10 - height) / 2
+            buffer_bottom_top = (self.output_size * 10 - height) / 2
+            bottom -= buffer_bottom_top
+            top += buffer_bottom_top
 
-        window = from_bounds(left, bottom, right, top, self.imagemeta["transform"])
+            window = from_bounds(left, bottom, right, top, self.imagemeta["transform"])
 
-        imagefile = self.imagefile
+            imagefile = self.imagefile
 
-        if os.path.exists(self.imagefilel2a):
-            if np.random.rand() > self.use_l2a_probability:
-                imagefile = self.imagefilel2a
+            if os.path.exists(self.imagefilel2a):
+                if np.random.rand() > self.use_l2a_probability:
+                    imagefile = self.imagefilel2a
 
-        with rio.open(imagefile) as src:
-            image = src.read(window=window)
-            # keep only 12 bands: delete 10th band (nb: 9 because start idx=0)
-            if (image.shape[0] == 13):  # is L1C Sentinel 2 data
-                image = image[[l1cbands.index(b) for b in l2abands]]
+            with rio.open(imagefile) as src:
+                image = src.read(window=window)
+                # keep only 12 bands: delete 10th band (nb: 9 because start idx=0)
+                if (image.shape[0] == 13):  # is L1C Sentinel 2 data
+                    image = image[[l1cbands.index(b) for b in l2abands]]
 
-            win_transform = src.window_transform(window)
+                win_transform = src.window_transform(window)
 
-        h_, w_ = image[0].shape
-        assert h_ > 0 and w_ > 0, f"{self.region}-{index} returned image size {image[0].shape}"
-        # only rasterize the not-hard negative mining samples
+            h_, w_ = image[0].shape
+            assert h_ > 0 and w_ > 0, f"{self.region}-{index} returned image size {image[0].shape}"
+            # only rasterize the not-hard negative mining samples
 
-        mask = features.rasterize(self.rasterize_geometries, all_touched=True,
-                                  transform=win_transform, out_shape=image[0].shape)
+            mask = features.rasterize(self.rasterize_geometries, all_touched=True,
+                                    transform=win_transform, out_shape=image[0].shape)
 
-        # if feature is near the image border, image wont be the desired output size
-        H, W = self.output_size, self.output_size
-        c, h, w = image.shape
-        dh = (H - h) / 2
-        dw = (W - w) / 2
-        image = np.pad(image, [(0, 0), (int(np.ceil(dh)), int(np.floor(dh))),
-                               (int(np.ceil(dw)), int(np.floor(dw)))])
+            # if feature is near the image border, image wont be the desired output size
+            H, W = self.output_size, self.output_size
+            c, h, w = image.shape
+            dh = (H - h) / 2
+            dw = (W - w) / 2
+            image = np.pad(image, [(0, 0), (int(np.ceil(dh)), int(np.floor(dh))),
+                                (int(np.ceil(dw)), int(np.floor(dw)))])
 
-        mask = np.pad(mask, [(int(np.ceil(dh)), int(np.floor(dh))),
-                             (int(np.ceil(dw)), int(np.floor(dw)))])
+            mask = np.pad(mask, [(int(np.ceil(dh)), int(np.floor(dh))),
+                                (int(np.ceil(dw)), int(np.floor(dw)))])
 
-        mask = mask.astype(float)
-        image = image.astype(float)
+            mask = mask.astype(float)
+            image = image.astype(float)
 
+            # Save image and mask
+            image_path = os.path.join(os.path.dirname(self.data_path), f"image-{index}.tif")
+            mask_path = os.path.join(os.path.dirname(self.data_path), f"mask-{index}.tif")
+            tifffile.imsave(image_path, image)
+            tifffile.imsave(mask_path, mask)
+            self.lines.at[index, "path-image"] = image_path
+            self.lines.at[index, "path-mask"] = mask_path
+            self.lines.to_file(self.data_path, driver="GeoJSON")
+
+        # Do transformations
         if self.transform is not None:
             image, mask = self.transform(image, mask)
 
@@ -370,7 +420,6 @@ class FloatingSeaObjectDataset(torch.utils.data.ConcatDataset):
         for dataset in tqdm(self.datasets):
             # Get the HNM patches
             hnm_patches = dataset.get_negative_patches(model)
-            hnm_patches["is_hnm"] = True
             
             # Delete the previous HNM
             dataset.lines = dataset.lines.loc[~dataset.lines["is_hnm"]]
