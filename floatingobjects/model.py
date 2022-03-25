@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.transforms.functional import resize
 
 def get_model(modelname, inchannels=12, pretrained=True):
     if modelname == "unet":
@@ -30,6 +31,8 @@ def get_model(modelname, inchannels=12, pretrained=True):
         model.encoder.conv1 = torch.nn.Conv2d(inchannels, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
     elif modelname == "classifier":
         model = Classifier(in_channels=inchannels)
+    elif modelname == "dummy":
+        model = DummyModel()
     else:
         raise ValueError(f"model {modelname} not recognized")
     return model
@@ -143,7 +146,15 @@ class UNet(nn.Module):
         logits = self.outc(x)
         return logits
 
+class DummyModel(nn.Module):
+    def __init__(self):
+        super(DummyModel, self).__init__()
 
+    def forward(self, x):
+        size = list(x.shape)
+        size[1] = 1
+        return torch.empty(size)
+    
 from torchvision.models import resnet18
 
 class Classifier(nn.Module):
@@ -160,45 +171,20 @@ class Classifier(nn.Module):
         y_pred = torch.sigmoid(self.resnet18(x))
         return y_pred
     
-    def sliding_windows(self, x, mask):
+    def sliding_windows(self, x, stride=1):
         # x of shape (N, C, H, W)
-        # mask : binary mask of shape (N, H, W)
-        # returns
+        # returns scores of shape (N, H, W)
+        self.eval()
         N, C, H, W = x.shape
-        out = torch.zeros_like(mask, dtype=torch.float32)
-        for i in range(N):
-            # bbox of the ship
-            idx_nonzero = mask[i].nonzero()
-            if idx_nonzero.shape[0] > 0:
-                min_h, max_h, min_w, max_w = idx_nonzero[:, 0].min(), idx_nonzero[:, 0].max(), idx_nonzero[:, 1].min(), idx_nonzero[:, 1].max()
-                top, bottom, left, right = min_h - 8, max_h + 7, min_w - 8, max_w + 7
-                pad_top, pad_bottom, pad_left, pad_right = 0, 0, 0, 0
-                if top < 0:
-                    pad_top = -top
-                    top = 0
-                if bottom > H - 1:
-                    pad_bottom = bottom - H + 1
-                    bottom = H - 1
-                if left < 0:
-                    pad_left = -left
-                    left = 0
-                if right > W - 1:
-                    pad_right = right - W + 1
-                    right = W - 1
-                x_i = x[i, :, top:bottom+1, left:right+1]
 
-                # Sliding windows
-                x_i = F.pad(x_i, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate")
-                x_unfold = F.unfold(x_i.unsqueeze(0), (16, 16))
-                x_unfold = x_unfold[0].view(C, 16, 16, -1).permute((3, 0, 1, 2)) # shape (L, C, h, w)
-                out_unfold = self.forward(x_unfold) # shape (L)
-                out_fold = out_unfold.view(1, 1, max_h-min_h+1, max_w-min_w+1) # shape (H, W)
+        x_unfold = F.unfold(x, (16, 16), padding=7, stride=stride)
+        x_unfold = x_unfold.view(C, 16, 16, -1).permute((3, 0, 1, 2)) # shape (N*L, C, h, w)
+        out_unfold = self.forward(x_unfold) # shape (N*L)
+        out_fold = out_unfold.view(N, 1, H//stride, W//stride)
+        scores = resize(out_fold, size=(H,W))
 
-                # Mean filter 16x16
-                norm_tensor = F.conv2d(torch.ones_like(out_fold), self.mean_filter, padding='same')
-                out_mean = F.conv2d(out_fold, self.mean_filter, padding='same') / norm_tensor
+        # Mean filter 16x16
+        #norm_tensor = F.conv2d(torch.ones_like(out_fold), self.mean_filter, padding='same')
+        #out_mean = F.conv2d(out_fold, self.mean_filter, padding='same') / norm_tensor
 
-                # Apply threshold
-                out[i, min_h:max_h+1, min_w:max_w+1] = out_mean
-        
-        return out
+        return scores[:, 0]
