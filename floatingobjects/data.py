@@ -1,3 +1,4 @@
+from floatingobjects.model import DummyModel
 import torch
 from rasterio.windows import from_bounds
 from rasterio.windows import Window
@@ -12,8 +13,13 @@ from itertools import product
 from tqdm import tqdm
 import tifffile
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 l1cbands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B10", "B11", "B12"]
 l2abands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
+
+from floatingobjects.transforms import transform as transform_func
 
 # offset from image border to sample hard negative mining samples
 HARD_NEGATIVE_MINING_SAMPLE_BORDER_OFFSET = 1000  # meter
@@ -112,7 +118,11 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
             self.lines = []
             return  # break early out of this function
 
-        self.transform = transform
+        if transform is None:
+            self.transform = None
+        else:
+            self.transform = transform_func
+            self.transform_params = transform
         self.region = region
 
         self.imagefile = imagefile
@@ -123,46 +133,53 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
             self.imagemeta = src.meta
             self.imagebounds = tuple(src.bounds)
         
+        self.data_path = os.path.join(root, str(self.output_size), "data", region, "data.geojson")
+        
         # Get geojson labels
-        self.data_path = os.path.join(root, "data", region, "data.geojson")
         if os.path.exists(self.data_path):
             self.lines = gpd.read_file(self.data_path)
         else:
             os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
-            lines = gpd.read_file(shapefile)
-            lines = lines.to_crs(self.imagemeta["crs"])
+            self.lines = gpd.read_file(shapefile).reset_index(drop=True)
+            self.lines = self.lines.to_crs(self.imagemeta["crs"])
 
-            # find closed lines, convert them to polygons and store them separately for later rasterization
-            is_closed_line = lines.geometry.apply(line_is_closed)
-            rasterize_polygons = lines.loc[is_closed_line].geometry.apply(Polygon)
+        # find closed lines, convert them to polygons and store them separately for later rasterization
+        is_closed_line = self.lines.geometry.apply(line_is_closed)
+        rasterize_polygons = self.lines.loc[is_closed_line].geometry.apply(Polygon)
 
-            self.lines = split_line_gdf_into_segments(lines)
+        #self.lines = split_line_gdf_into_segments(self.lines)
 
-            self.lines["is_hnm"] = False
-            if hard_negative_mining:
-                random_points = self.sample_points_for_hard_negative_mining()
-                random_points["is_hnm"] = True
-                self.lines = pd.concat([self.lines, random_points]).reset_index(drop=True)
+        self.lines["is_hnm"] = False
 
-            # remove line segments that are outside the image bounds
-            self.lines = self.lines.loc[self.lines.geometry.apply(self.within_image)]
+        # remove line segments that are outside the image bounds
+        self.lines = self.lines.loc[self.lines.geometry.apply(self.within_image)]
 
-            # take lines to rasterize
-            rasterize_lines = self.lines.loc[~self.lines["is_hnm"]].geometry
+        # take lines to rasterize
+        rasterize_lines = self.lines.geometry
 
-            # combine with polygons to rasterize
-            self.rasterize_geometries = pd.concat([rasterize_lines, rasterize_polygons])
+        # combine with polygons to rasterize
+        self.rasterize_geometries = pd.concat([rasterize_lines, rasterize_polygons])
 
+        if not os.path.exists(self.data_path):
+            self.lines.reset_index(drop=True, inplace=True)
             self.lines["path-image"] = None
             self.lines["path-mask"] = None
             self.lines.to_file(self.data_path, driver="GeoJSON")
 
-        self.hnm_path = os.path.join(root, "hnm", region, "hnm.geojson")
-        if os.path.exists(self.hnm_path):
-            self.hnm_database = gpd.read_file(self.hnm_path)
-        else:
-            os.makedirs(os.path.dirname(self.hnm_path), exist_ok=True)
-            self.hnm_database = None
+        
+        self.train_db = self.lines.copy() # by default the train_db contains only labelled data
+
+        if hard_negative_mining:
+            self.hnm_path = os.path.join(root, str(self.output_size), "hnm", region, "hnm.geojson")
+            if os.path.exists(self.hnm_path):
+                self.hnm_database = gpd.read_file(self.hnm_path)
+            else:
+                os.makedirs(os.path.dirname(self.hnm_path), exist_ok=True)
+                self.hnm_database = gpd.GeoDataFrame(columns=self.lines.columns) # empty dataframe
+                print("Creating hard negative mining patches... This process takes a while")
+                self.get_negative_patches(DummyModel())
+            
+            self.train_db = pd.concat([self.lines, self.hnm_database]).reset_index(drop=True)
 
 
     def within_image(self, geometry):
@@ -195,11 +212,12 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
 
         return gpd.GeoDataFrame(geometry=gpd.points_from_xy(zx, zy))
     
-    def get_negative_patches(self, model):
+    def get_negative_patches(self, model, method="fpr", num=None):
         """This method returns the patches that doesn't contain floating objects
          which have a bad score (bad false positive rate) 
         Args:
          - model: the model to test
+         - method: method to rank the patches, fpr or random
         Returns:
          - patches: Geodataframe of Point geometries, store negative patches
         """
@@ -215,14 +233,14 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
 
         image_window = Window(0, 0, meta["width"], meta["height"])
 
-        floating_objects_lines = self.lines.loc[~self.lines["is_hnm"]]
         threshold = 0.03
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        def iterate_database(df):
-            for i, row in df.iterrows():
+        def iterate_database(df, n):
+            index = np.random.choice(df.index, n)
+            for i, row in df.loc[index].iterrows():
                 image = tifffile.imread(row["path-image"]).astype(float)
-                yield image, row["path-image"], row["path-mask"], row["geometry"]
+                yield image, i
 
         def save_and_iterate_database():
             for i, (r, c) in enumerate(product(rows, cols)):
@@ -238,7 +256,7 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
                 )
                 points = list(zip(xs,ys))
                 poly = Polygon(points)
-                if floating_objects_lines.crosses(poly).sum() == 0: # Check if there is a floating object in the windows
+                if self.lines.crosses(poly).sum() == 0: # Check if there is a floating object in the windows
                     
                     # write
                     left, bottom, right, top = poly.bounds
@@ -252,71 +270,86 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
                     # if L1C image (13 bands). read only the 12 bands compatible with L2A data
                     if (image.shape[0] == 13):
                         image = image[[l1cbands.index(b) for b in l2abands]]
-                    
-                    mask = np.zeros(image.shape[:2])
 
                     assert image.shape[1] == self.output_size and image.shape[2] == self.output_size, f"{self.region}-{i}-hnm returned image size {image[1].shape}"
                     
-                    path_image = os.path.join(os.path.dirname(self.hnm_path), f"{i}-image.tif")
-                    path_mask = os.path.join(os.path.dirname(self.hnm_path), f"{i}-mask.tif")
+                    path_image = os.path.abspath(os.path.join(os.path.dirname(self.hnm_path), f"{i}-image.tif"))
                     tifffile.imsave(path_image, image)
-                    tifffile.imsave(path_mask, mask)
 
-                    yield image, path_image, path_mask, geometry
+                    i = 0 if pd.isnull(self.hnm_database.index.max()) else self.hnm_database.index.max() + 1
+                    self.hnm_database.loc[
+                        i,
+                        ["geometry", "path-image", "path-mask", "is_hnm"]
+                    ] = [geometry, path_image, None, True]
+
+                    yield image, i
         
-        if self.hnm_database is not None:
-            iterator = iterate_database(self.hnm_database)
+        if num is None:
+            num = len(self.lines) * 3
+        
+        if len(self.hnm_database) > 0:
+            iterator = iterate_database(self.hnm_database, max(num, int(0.1*len(self.hnm_database))))
+            save = False
         else:
             iterator = save_and_iterate_database()
+            save = True
         
         false_positive_rates = []
+        indices = []
+        for image, i in tqdm(iterator, leave=False):
+            indices.append(i)
+            if method == "fpr":
+                # to torch + normalize
+                x = torch.from_numpy(image.astype(np.float32))
+                if self.transform is not None:
+                    x, _ = self.transform(x, torch.zeros_like(x), "test", 0, self.transform_params[2])
+                    x = x.to(device)
 
-        if self.hnm_database is None:
-            geometries = []
-            paths_image = []
-            paths_mask = []
-        for image, path_image, path_mask, geometry in iterator:
-            if self.hnm_database is None: # if the database is not built, save the patches
-                paths_image.append(path_image)
-                paths_mask.append(path_mask)
-                geometries.append(geometry)
-
-            # to torch + normalize
-            x = torch.from_numpy(image.astype(np.float32))
-            if self.transform is not None:
-                x, _ = self.transform(x, torch.zeros_like(x))
-                x = x.to(device)
-
-            # predict
-            with torch.no_grad():
-                x = x.unsqueeze(0) 
-                y_logits = torch.sigmoid(model(x).squeeze(0))
-                y_score = y_logits.cpu().detach().numpy()[0]
-                false_positive_rate = (y_score > threshold).sum() / y_score.size
-                false_positive_rates.append(false_positive_rate)
+                # predict
+                with torch.no_grad():
+                    x = x.unsqueeze(0) 
+                    y_logits = torch.sigmoid(model(x).squeeze(0))
+                    y_score = y_logits.cpu().detach().numpy()[0]
+                    false_positive_rate = (y_score > threshold).sum() / y_score.size
+            
+            elif method == "random":
+                false_positive_rate = 0
+            
+            false_positive_rates.append(false_positive_rate)
         
-        if self.hnm_database is None:
-            # Create the HNM database
-            self.hnm_database = gpd.GeoDataFrame(data={"geometry": geometries, "path-image": paths_image, "path-mask": paths_mask})
-            self.hnm_database["is_hnm"] = True
+        indices = np.array(indices)
+        
+        if save and len(self.hnm_database) > 0:
             self.hnm_database.to_file(self.hnm_path, driver="GeoJSON")
+
+        if num > len(false_positive_rates):
+            print(f"""Warning not enough HNM patches available for {self.region}: 
+                {num} patches asked, {len(false_positive_rates)} available""")
         
-        N = min(len(floating_objects_lines) * 3, len(false_positive_rates))
+        false_positive_rates = np.array(false_positive_rates)
         # Take zx, zy from patches_x, patches_y based on the false positive rates
-        indices = np.array(false_positive_rates).argsort()[::-1][:N]
+        if method == "fpr":
+            indices = indices[false_positive_rates.argsort()[::-1]]
+        elif method == "random":
+            np.random.shuffle(indices)
         
+        indices = indices[:num]
         patches = self.hnm_database.iloc[indices]
-        return patches
+        return patches, false_positive_rates
 
     def __len__(self):
-        return len(self.lines)
+        return len(self.train_db)
 
     def __getitem__(self, index):
-        line = self.lines.iloc[index]
-        if (line["path-image"] is not None) and (line["path-mask"] is not None): # The patch is saved in the data/region folder
+        line = self.train_db.iloc[index]
+        if line["is_hnm"] and line["path-image"] is not None:
+            image = tifffile.imread(line["path-image"]).astype(float)
+            mask = np.zeros((self.output_size, self.output_size))
+        
+        elif (line["path-image"] is not None) and (line["path-mask"] is not None): # The patch is saved in the data/region folder
             image = tifffile.imread(line["path-image"]).astype(float)
             mask = tifffile.imread(line["path-mask"]).astype(float)
-        
+
         else: # The patch is not saved, read it on the main image then save it
             left, bottom, right, top = line.geometry.bounds
 
@@ -371,17 +404,21 @@ class FloatingSeaObjectRegionDataset(torch.utils.data.Dataset):
             image = image.astype(float)
 
             # Save image and mask
-            image_path = os.path.join(os.path.dirname(self.data_path), f"image-{index}.tif")
-            mask_path = os.path.join(os.path.dirname(self.data_path), f"mask-{index}.tif")
+            image_path = os.path.abspath(os.path.join(os.path.dirname(self.data_path), f"image-{index}.tif"))
+            mask_path = os.path.abspath(os.path.join(os.path.dirname(self.data_path), f"mask-{index}.tif"))
             tifffile.imsave(image_path, image)
             tifffile.imsave(mask_path, mask)
-            self.lines.at[index, "path-image"] = image_path
-            self.lines.at[index, "path-mask"] = mask_path
+            self.train_db.loc[index, ["path-image", "path-mask"]] = [image_path, mask_path]
+            self.lines.loc[index, ["path-image", "path-mask"]] = [image_path, mask_path]
             self.lines.to_file(self.data_path, driver="GeoJSON")
 
+        c, h, w = image.shape
+        assert h == self.output_size and w == self.output_size, f"{self.region}-{index} returned image size {image.shape} when asked output size is {self.output_size}"
+        h, w = mask.shape
+        assert h == self.output_size and w == self.output_size, f"{self.region}-{index} returned mask size {mask.shape} when asked output size is {self.output_size}"
         # Do transformations
         if self.transform is not None:
-            image, mask = self.transform(image, mask)
+            image, mask = self.transform(image, mask, self.transform_params[0],self.transform_params[1], self.transform_params[2])
 
         image = np.nan_to_num(image)
 
@@ -416,18 +453,34 @@ class FloatingSeaObjectDataset(torch.utils.data.ConcatDataset):
             [FloatingSeaObjectRegionDataset(root, region, **kwargs) for region in self.regions]
         )
     
-    def update_hard_negative_mining(self, model):
+    def get_negative_patches(self, model, method="fpr", num=None):
+        false_positive_rates = []
+        hnm_patches_list = []
         for dataset in tqdm(self.datasets):
-            # Get the HNM patches
-            hnm_patches = dataset.get_negative_patches(model)
-            
-            # Delete the previous HNM
-            dataset.lines = dataset.lines.loc[~dataset.lines["is_hnm"]]
-            
-            # Add the new HNM patches to dataset 
-            dataset.lines = pd.concat([dataset.lines, hnm_patches]).reset_index(drop=True)
+            if num == "same":
+                num = len(dataset.lines)
+            hnm_patches, fpr = dataset.get_negative_patches(model, method=method, num=num)
+            false_positive_rates.append(fpr)
+            hnm_patches_list.append(hnm_patches)
         
+        return hnm_patches_list, np.concatenate(false_positive_rates)
+
+    
+    def update_hard_negative_mining(self, hnm_patches):
+        for dataset, patches in zip(self.datasets, hnm_patches):
+            dataset.train_db = pd.concat([dataset.lines, patches]).reset_index(drop=True)
         super().__init__(self.datasets)
+    
+    def filter_hnm(self):
+        hnm_indices = []
+        i = 0
+        for dataset in self.datasets:
+            for j in range(len(dataset)):
+                if dataset.train_db.iloc[j]["is_hnm"]:
+                    hnm_indices.append(i)
+                i += 1
+        return hnm_indices
+
 
 
 
