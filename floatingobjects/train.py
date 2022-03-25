@@ -2,6 +2,7 @@ import os
 from tqdm import tqdm
 import numpy as np
 import argparse
+import datetime
 
 import torch
 import torch.nn as nn
@@ -26,6 +27,7 @@ def parse_args():
     parser.add_argument('--model', type=str, default="unet")
     parser.add_argument('--add-fdi-ndvi', action="store_true")
     parser.add_argument('--hnm', action="store_true")
+    parser.add_argument('--old-hnm', action="store_true")
     parser.add_argument('--image-size', type=int, default=128)
     parser.add_argument('--device', type=str, choices=["cpu", "cuda"], default="cuda")
     parser.add_argument('--epochs', type=int, default=50)
@@ -50,13 +52,14 @@ def main(args):
     n_epochs = args.epochs
     learning_rate = args.learning_rate
     hnm = args.hnm
+    old_hnm = args.old_hnm
 
     tensorboard_logdir = args.tensorboard_logdir
 
-    dataset = FloatingSeaObjectDataset(data_path, fold="train", transform=get_transform("train", intensity=args.augmentation_intensity, add_fdi_ndvi=args.add_fdi_ndvi),
-                                       output_size=image_size, seed=args.seed)
-    valid_dataset = FloatingSeaObjectDataset(data_path, fold="val", transform=get_transform("test", add_fdi_ndvi=args.add_fdi_ndvi),
-                                             output_size=image_size, seed=args.seed, hard_negative_mining=False)
+    dataset = FloatingSeaObjectDataset(data_path, foldn=1, fold="train", transform=("train", args.augmentation_intensity, args.add_fdi_ndvi),
+                                       output_size=image_size, seed=args.seed, hard_negative_mining=hnm)
+    valid_dataset = FloatingSeaObjectDataset(data_path, foldn=1, fold="val", transform=("test", 0, args.add_fdi_ndvi),
+                                             output_size=image_size, seed=args.seed, hard_negative_mining=hnm)
 
     # store run arguments in the same folder
     run_arguments = vars(args)
@@ -106,15 +109,24 @@ def main(args):
         logs = []
 
     # create summary writer if tensorboard_logdir is not None
-    writer = SummaryWriter(log_dir=tensorboard_logdir) if tensorboard_logdir is not None else None
+    writer = SummaryWriter(log_dir=os.path.join(tensorboard_logdir, datetime.datetime.now().strftime("%Y%m%d%H%M%S"))) if tensorboard_logdir is not None else None
 
+    if hnm:
+        hnm_patches, fpr = dataset.get_negative_patches(model, method="random")
+        dataset.update_hard_negative_mining(hnm_patches)
+    
+    
     for epoch in range(start_epoch, n_epochs + 1):
         trainloss = training_epoch(model, train_loader, optimizer, criterion, device)
 
-        if hnm:
+        if hnm and epoch % 5 == 0:
             # Update the dataset, test the negative patches of the dataset
             # take the ones with the worst false positive rates and add them to the dataset
-            dataset.update_hard_negative_mining(model)
+            if not old_hnm:
+                hnm_patches, fpr = dataset.get_negative_patches(model, method="fpr")
+                dataset.update_hard_negative_mining(hnm_patches)
+            else:
+                _, fpr = dataset.get_negative_patches(model, method="fpr")
             
         valloss, metrics = validating_epoch(model, val_loader, criterion, device)
 
@@ -128,7 +140,8 @@ def main(args):
         logs.append(log)
 
         if writer is not None:
-            writer.add_scalars("loss", {"train": trainloss, "val": valloss}, global_step=epoch)
+            writer.add_scalar("loss_train", trainloss, global_step=epoch)
+            writer.add_scalar("loss_val", valloss, global_step=epoch)
             fig = predict_images(val_loader, model, device)
             writer.add_figure("predictions", fig, global_step=epoch)
 
@@ -147,6 +160,13 @@ def main(args):
             predictions = np.hstack([floating_predictions, not_floating_predictions])
             targets = np.hstack([np.ones_like(floating_predictions), np.zeros_like(not_floating_predictions)])
             writer.add_pr_curve("balanced", targets, predictions, global_step=epoch)
+
+            if hnm and epoch % 5 == 0:
+                writer.add_histogram("FPR histogram", fpr, global_step=epoch)
+                writer.add_scalar("FPR mean", fpr.mean(), global_step=epoch)
+            
+            for m in ["kappa", "precision", "recall", "fscore"]:
+                writer.add_scalar(m, metrics[m], global_step=epoch)
 
         # retrieve best loss by iterating through previous logged losses
         best_loss = min([l["valloss"] for l in logs])
@@ -182,6 +202,20 @@ def training_epoch(model, train_loader, optimizer, criterion, device):
     return np.array(losses).mean()
 
 
+def get_metrics(confusion_matrix):
+    n_classes = len(confusion_matrix)
+    out = [{} for i in range(n_classes)] # store precision+recall+f1-score
+    for c in range(n_classes):
+        tp = confusion_matrix[c, c]
+        fp = confusion_matrix[:, c].sum() - tp
+        fn = confusion_matrix[c, :].sum() - tp
+        tn = confusion_matrix.sum() - (tp+fp+fn)
+        out[c]["precision"] = tp / (fp + tp) # Precision
+        out[c]["recall"] = tp / (fn + tp) # Recall
+        out[c]["fscore"] = 2 / (1/out[c]["precision"] + 1/out[c]["recall"]) # F1-score
+        out[c]["kappa"] = 2 * (tp*tn-fn*fp) / ((tp+fp)*(fp+tn)+(tp+fn)*(fn+tn))
+    return out
+
 def validating_epoch(model, val_loader, criterion, device):
     with torch.no_grad():
         model.eval()
@@ -193,6 +227,7 @@ def validating_epoch(model, val_loader, criterion, device):
             kappa = []
         )
         with tqdm(enumerate(val_loader), total=len(val_loader), leave=False) as pbar:
+            cm = np.zeros((2,2))
             for idx, batch in pbar:
                 im, target, id = batch
                 im = im.to(device)
@@ -205,15 +240,15 @@ def validating_epoch(model, val_loader, criterion, device):
                 predictions = (y_pred.exp() > 0.5).cpu().detach().numpy()
                 y_true = target.cpu().view(-1).numpy().astype(bool)
                 y_pred = predictions.reshape(-1)
-                p,r,f,s = precision_recall_fscore_support(y_true=y_true,
-                                                y_pred=y_pred, zero_division=0)
-                metrics["kappa"] = cohen_kappa_score(y_true, y_pred)
-                metrics["precision"].append(p)
-                metrics["recall"].append(r)
-                metrics["fscore"].append(f)
+                cm += np.bincount(y_true * 2 + y_pred, minlength=4).reshape(2, 2).astype(int)
 
-    for k,v in metrics.items():
-        metrics[k] = np.array(v).mean()
+    # Take only some pixels, this is how ESA did their tests
+    N = 20000
+    cm = cm.astype(float)
+    n_true = cm.sum(axis=1)
+    cm = (N * cm / n_true[:,None]).astype(int)
+    metrics = get_metrics(cm)
+    metrics = metrics[1] # Take metrics of the water debris class
 
     return np.array(losses).mean(), metrics
 
