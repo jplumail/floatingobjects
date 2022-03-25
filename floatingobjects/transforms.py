@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import random
-from .data import l2abands as bands
+from floatingobjects.data import l2abands as bands
 
 #from torchvision import transforms
 """
@@ -12,6 +12,19 @@ def center_crop(image,mask):
     mask = R(mask)
     return image, mask
 """
+def transform(image, mask, mode, intensity=0, add_fdi_nvdi=False):
+
+    if add_fdi_nvdi:
+        fdi = np.expand_dims(calculate_fdi(image),0)
+        ndvi = np.expand_dims(calculate_ndvi(image),0)
+        image = np.vstack([image,ndvi,fdi])
+
+    image *= 1e-4
+    if mode == "train":
+        data_augmentation = get_data_augmentation(intensity=intensity)
+        return data_augmentation(image, mask)
+    return image, mask
+
 
 def get_transform(mode, intensity=0, add_fdi_ndvi=False):
     assert mode in ["train", "test"]
@@ -36,8 +49,6 @@ def get_transform(mode, intensity=0, add_fdi_ndvi=False):
                 image = np.vstack([image,ndvi,fdi])
 
             image *= 1e-4
-            image = torch.Tensor(image)
-            mask = torch.Tensor(mask)
             return image, mask
         return test_transform
 
